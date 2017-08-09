@@ -10,12 +10,17 @@ niff
 
 import argparse
 import subprocess
+from urllib.request import urlopen
 from urllib.parse  import urlparse
 import os
+import json
 
 EXTENSIONS_ARCHIVE = [".tar", ".tar.gz", ".zip"]
 
-PREFIX = '<nixpkgs>'
+EXTENSION_TARBALL = '.tar.gz'
+
+PR_REPO = "NixOS/nixpkgs"
+
 
 
 def _packages(nix):
@@ -38,62 +43,143 @@ def _fetch_url(url, unpack):
     :param unpack: Whether to unpack archive or not.
     :returns: Path to Nix expression.
     """
-    cmd = ['nix-prefetch-url', '--print-path', url]
-    if unpack:
-        cmd.append('--unpack')
-    output = subprocess.check_output(cmd, universal_newlines=True)
+    unpack = '--unpack' if unpack else ''
+    cmd = f"nix-prefetch-url --print-path {unpack} {url}".split()
+    output = subprocess.check_output(cmd, universal_newlines=True, stderr=subprocess.DEVNULL)
     _, path = output.rstrip().split('\n')
     return path
 
 
-def _determine_nixpath_prefix(prefix):
+def _translate_nixpath(url):
     """Determine path to Nix file from NIX_PATH.
 
-    :param prefix: A `NIX_PATH` prefix.
-    :returns: Path to Nix expression.
+    :param prefix: A `NIX_PATH` prefix without `<` and `>`.
+    :returns: url to Nix expression.
     """
+    prefix = url[10:]
     nixpath = os.environ['NIX_PATH']
     if not nixpath:
         raise ValueError(f'NIX_PATH is not set. Cannot find {prefix}')
 
     paths = nixpath.split(':')
     for path in paths:
-        if path.startswith(f'{prefix[1:-1]}='):
-            return path[8:]
-    for path in paths:
-        if os.path.exists(path) and (f'{prefix[1:-1]}' in os.listdir(path)):
-            return os.path.join(path, prefix[1:-1])
+        if path.startswith(f'{prefix}='):
+            path = path[8:]
+            break
+    else:
+        for path in paths:
+            if os.path.exists(path) and (f'{prefix}' in os.listdir(path)):
+                path = os.path.join(path, prefix)
+                break
+        else:
+            raise ValueError(f"No value found for {path} in NIX_PATH")
+
+    path = f"file://{path}"
+    return path
 
 
-def _retrieve_nix_expression(url):
-    """Retrieve Nix expression `url`.
+def _translate_github(url):
+    """Translate GitHub url to https url.
+    """
+    owner, repo, ref = url[9:].split('/')
+    return f"https://github.com/{owner}/{repo}/archive/{ref}{EXTENSION_TARBALL}"
+
+
+def _translate_channel(url):
+    """Translate Nixpkgs channel to https url.
+    """
+    channel = url[10:]
+    return f"https://github.com/NixOS/nixpkgs-channels/archive/{channel}{EXTENSION_TARBALL}"
+
+
+def _translate_ref(url):
+    """Translate Nixpkgs ref to url.
+    """
+    ref = url[6:]
+    return f"https://github.com/NixOS/nixpkgs/archive/{ref}{EXTENSION_TARBALL}"
+
+
+def _translate_pr(url):
+    """Translate PR to url.
+    """
+    pr = url[5:]
+    head, base = _determine_pr_urls(pr)
+    return head
+
+
+def _determine_pr_urls(pr):
+    """Determine the urls to archives of the head and base of the PR.
+
+    :param pr: String or integer representing PR. Without #.
+    :returns: Tuple of two urls. First is head, second base.
+    """
+    pr = str(pr)
+    url = f"https://api.github.com/repos/{PR_REPO}/pulls/{pr}"
+    response = urlopen(url).read().decode('utf-8')
+    data = json.loads(response)
+
+    head_repo = data['head']['repo']['full_name']
+    head_branch = data['head']['ref']
+    base_repo = data['base']['repo']['full_name']
+    base_branch = data['base']['ref']
+
+    head = f"https://github.com/{head_repo}/archive/{head_branch}{EXTENSION_TARBALL}"
+    base = f"https://github.com/{base_repo}/archive/{base_branch}{EXTENSION_TARBALL}"
+
+    return head, base
+
+
+TRANSLATORS = {
+    'nixpath'   :   _translate_nixpath,
+    'github'    :   _translate_github,
+    'channel'   :   _translate_channel,
+    'ref'       :   _translate_ref,
+    'pr'        :   _translate_pr
+    }
+
+
+def _determine_url_with_scheme(url):
+    """Update url to include a scheme.
+    """
+
+    # Identify the kind of string we have and construct proper url with scheme.
+    # Check if we have a Nix prefix (e.g. <nixpkgs>)
+    #if url.startswith('<') and url.endswith('>'):
+        #url = f"nixpath://{url[1:-1]}"
+        #url = _determine_nixpath_prefix(url)
+    # Check if we have a pull request
+    #if url.startswith('#'):
+        ## Determine PR, remove # from number
+        #url = _determine_pr_urls(url[1:])[0]
+
+    if not urlparse(url).scheme:
+        url = f"file://{os.path.abspath(url)}"
+
+    # Translate to file:// or https://
+    # The lambda is there in case of schemes that need to translation.
+    url = TRANSLATORS.get(urlparse(url).scheme, lambda x: x)(url)
+    scheme = urlparse(url).scheme
+    return scheme, url
+
+
+def path(url):
+    """Get path to Nix expression.
 
     :param url: Url to tree.
     :returns: Path to Nix expression.
-
-    This function uses `nix-prefetch-url`.
     """
-    if url.startswith('<') and url.endswith('>'):
-        url = _determine_nixpath_prefix(url)
+    scheme, url = _determine_url_with_scheme(url)
 
-    scheme = urlparse(url).scheme
+    local = scheme == 'file'
     archive = any(map(url.endswith, EXTENSIONS_ARCHIVE))
-
-    if not scheme:
-        local = True
-        url = os.path.abspath(url)
-    elif scheme == 'file':
-        local = True
-        url = url[7:]
-    else:
-        local = False
 
     if archive:
         path = _fetch_url(url, unpack=True)
     elif not local:
         path = _fetch_url(url, unpack=False)
     else:
-        path = url
+        # Local and not an archive. In that case we do not use `nix-prefetch-url`
+        path = url[7:]
 
     return path
 
@@ -105,25 +191,75 @@ def diff(a, b):
     :param b: Reference Nix expression.
     :returns: List of attributes that have changed.
     """
-    a = _retrieve_nix_expression(a)
-    b = _retrieve_nix_expression(b)
+    a = path(a)
+    b = path(b)
     diff = list(set(_packages(a)) - set(_packages(b)))
     attributes = sorted((s.split()[0] for s in diff))
     return attributes
 
 
+def pr(number):
+    """Determine difference of PR.
+
+    :param pr: String or integer representing PR. Without #.
+    :returns: List of attribute names that head has but base has not.
+    """
+    parsed = urlparse(number)
+    if parsed.scheme:
+        if parsed.scheme == 'pr':
+            number = number[5:]
+        else:
+            ValueError("Invalid scheme for {number}.")
+    else:
+        pass
+    head, base = _determine_pr_urls(number)
+    return diff(head, base)
+
+
+def _print_list(pkgs):
+    for pkg in pkgs:
+        print(pkg)
+
+
+def _print_attrs(pkgs):
+    print("".join(list(map(lambda x: f" -A {x}", pkgs))))
+
+
+OUTPUT_FORMATS = {
+    'attrs'     :   _print_attrs,
+    'list'      :   _print_list
+    }
+
+
 def main():
 
     parser = argparse.ArgumentParser("Determine which Nix packages need to be rebuild.")
-    parser.add_argument('a', type=str, help="Nix file.")
-    parser.add_argument('--b', type=str, help="Reference Nix file.", default=PREFIX)
+    parser.set_defaults(func=lambda args: parser.print_help())
+
+    subparsers = parser.add_subparsers()
+
+    # `diff` command
+    parser_diff = subparsers.add_parser('diff')
+    parser_diff.add_argument('expr', type=str, help="Nix expression")
+    parser_diff.add_argument('against', type=str, help="Reference Nix expression")
+    parser_diff.add_argument('--output', type=str, help="Output format", default="list", choices=OUTPUT_FORMATS.keys())
+    parser_diff.set_defaults(func=lambda args: OUTPUT_FORMATS[args.output](diff(args.expr, args.against)))
+
+    # `pr` command
+    parser_pr = subparsers.add_parser('pr')
+    parser_pr.add_argument('number', type=str, help="Pull request number")
+    #parser_pr.add_argument('--against', type=str, help="Reference Nix expression")
+    parser_pr.add_argument('--output', type=str, help="Output format", default="list", choices=OUTPUT_FORMATS.keys())
+    parser_pr.set_defaults(func=lambda args: OUTPUT_FORMATS[args.output](pr(args.number)))
+
+    # `path` command
+    parser_path = subparsers.add_parser('path')
+    parser_path.add_argument('a', type=str, help="Nix expression")
+    parser_path.add_argument('--output', type=str, help="Output format", default="list", choices=OUTPUT_FORMATS.keys())
+    parser_path.set_defaults(func=lambda args: print(path(args.a)))
 
     args = parser.parse_args()
-
-    attributes = diff(args.a, args.b)
-
-    for attribute in attributes:
-        print(attribute)
+    args.func(args)
 
 
 if __name__ == '__main__':
