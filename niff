@@ -1,0 +1,130 @@
+#! /usr/bin/env nix-shell
+#! nix-shell -i python3 -p python36
+
+"""
+niff
+====
+
+`niff` is a script that compares two Nix expressions and determines which attributes changed.
+"""
+
+import argparse
+import subprocess
+from urllib.parse  import urlparse
+import os
+
+EXTENSIONS_ARCHIVE = [".tar", ".tar.gz", ".zip"]
+
+PREFIX = '<nixpkgs>'
+
+
+def _packages(nix):
+    """List all nix packages in the tree.
+
+    :param nix: Path to Nix expression.
+    :returns: List of derivations
+
+    This function uses `nix-env`.
+    """
+    output = subprocess.check_output(['nix-env', '-f', nix, '-qaP', '--out-path', '--show-trace'],
+                                     universal_newlines=True)
+    return output.rstrip().split('\n')
+
+
+def _fetch_url(url, unpack):
+    """Fetch an url and optionally unpack in case of an archive.
+
+    :param url: Url.
+    :param unpack: Whether to unpack archive or not.
+    :returns: Path to Nix expression.
+    """
+    cmd = ['nix-prefetch-url', '--print-path', url]
+    if unpack:
+        cmd.append('--unpack')
+    output = subprocess.check_output(cmd, universal_newlines=True)
+    _, path = output.rstrip().split('\n')
+    return path
+
+
+def _determine_nixpath_prefix(prefix):
+    """Determine path to Nix file from NIX_PATH.
+
+    :param prefix: A `NIX_PATH` prefix.
+    :returns: Path to Nix expression.
+    """
+    nixpath = os.environ['NIX_PATH']
+    if not nixpath:
+        raise ValueError(f'NIX_PATH is not set. Cannot find {prefix}')
+
+    paths = nixpath.split(':')
+    for path in paths:
+        if path.startswith(f'{prefix[1:-1]}='):
+            return path[8:]
+    for path in paths:
+        if os.path.exists(path) and (f'{prefix[1:-1]}' in os.listdir(path)):
+            return os.path.join(path, prefix[1:-1])
+
+
+def _retrieve_nix_expression(url):
+    """Retrieve Nix expression `url`.
+
+    :param url: Url to tree.
+    :returns: Path to Nix expression.
+
+    This function uses `nix-prefetch-url`.
+    """
+    if url.startswith('<') and url.endswith('>'):
+        url = _determine_nixpath_prefix(url)
+
+    scheme = urlparse(url).scheme
+    archive = any(map(url.endswith, EXTENSIONS_ARCHIVE))
+
+    if not scheme:
+        local = True
+        url = os.path.abspath(url)
+    elif scheme == 'file':
+        local = True
+        url = url[7:]
+    else:
+        local = False
+
+    if archive:
+        path = _fetch_url(url, unpack=True)
+    elif not local:
+        path = _fetch_url(url, unpack=False)
+    else:
+        path = url
+
+    return path
+
+
+def diff(a, b):
+    """Determine difference between two Nix files.
+
+    :param a: Nix expression.
+    :param b: Reference Nix expression.
+    :returns: List of attributes that have changed.
+    """
+    a = _retrieve_nix_expression(a)
+    b = _retrieve_nix_expression(b)
+    diff = list(set(_packages(a)) - set(_packages(b)))
+    attributes = sorted((s.split()[0] for s in diff))
+    return attributes
+
+
+def main():
+
+    parser = argparse.ArgumentParser("Determine which Nix packages need to be rebuild.")
+    parser.add_argument('a', type=str, help="Nix file.")
+    parser.add_argument('--b', type=str, help="Reference Nix file.", default=PREFIX)
+
+    args = parser.parse_args()
+
+    attributes = diff(args.a, args.b)
+
+    for attribute in attributes:
+        print(attribute)
+
+
+if __name__ == '__main__':
+    main()
