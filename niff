@@ -14,6 +14,7 @@ from urllib.request import urlopen
 from urllib.parse  import urlparse
 import os
 import json
+from concurrent.futures import ProcessPoolExecutor as Pool
 
 EXTENSIONS_ARCHIVE = [".tar", ".tar.gz", ".zip"]
 
@@ -193,7 +194,9 @@ def diff(a, b):
     """
     a = path(a)
     b = path(b)
-    diff = list(set(_packages(a)) - set(_packages(b)))
+    with Pool() as p:
+        a, b = p.map(_packages, [a, b])
+    diff = list(set(a)-set(b))
     attributes = sorted((s.split()[0] for s in diff))
     return attributes
 
